@@ -3,6 +3,11 @@
 #include "esphome/core/log.h"
 #include "esphome/core/util.h"
 
+#ifndef USE_ESP32
+#define USE_ESP32
+#define USE_ETHERNET_SPI
+#define USE_ETHERNET_ENC28J60
+#endif
 #ifdef USE_ESP32
 
 #include <lwip/dns.h>
@@ -12,6 +17,10 @@
 #ifdef USE_ETHERNET_SPI
 #include <driver/gpio.h>
 #include <driver/spi_master.h>
+#endif
+
+#ifdef USE_ETHERNET_ENC28J60
+#include "esp_eth_enc28j60.h"
 #endif
 
 namespace esphome {
@@ -90,8 +99,8 @@ void EthernetComponent::setup() {
 
 #ifdef USE_ETHERNET_SPI  // Configure SPI interface and Ethernet driver for specific SPI module
   spi_device_interface_config_t devcfg = {
-      .command_bits = 16,  // Actually it's the address phase in W5500 SPI frame
-      .address_bits = 8,   // Actually it's the control phase in W5500 SPI frame
+      .command_bits = 0,
+      .address_bits = 0,
       .dummy_bits = 0,
       .mode = 0,
       .duty_cycle_pos = 0,
@@ -105,6 +114,11 @@ void EthernetComponent::setup() {
       .pre_cb = nullptr,
       .post_cb = nullptr,
   };
+#endif
+
+#ifdef USER_ETHERNET_W5500
+  devcfg.command_bits = 16;  // Actually it's the address phase in W5500 SPI frame
+  devcfg.address_bits = 8;   // Actually it's the control phase in W5500 SPI frame
 
 #if USE_ESP_IDF && (ESP_IDF_VERSION_MAJOR >= 5)
   eth_w5500_config_t w5500_config = ETH_W5500_DEFAULT_CONFIG(host, &devcfg);
@@ -120,6 +134,30 @@ void EthernetComponent::setup() {
   phy_config.reset_gpio_num = this->reset_pin_;
 
   esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_config, &mac_config);
+#elif defined(USE_ETHERNET_ENC28J60)
+
+  devcfg.command_bits = 3;
+  devcfg.address_bits = 5;
+  devcfg.cs_ena_posttrans = enc28j60_cal_spi_cs_hold_time(this->clock_speed_ / 1000000);
+
+  // Setup ENC28J60 here.
+  spi_device_handle_t spi_handle = nullptr;
+  err = spi_bus_add_device(host, &devcfg, &spi_handle);
+  ESPHL_ERROR_CHECK(err, "SPI bus add device error");
+
+  eth_enc28j60_config_t enc28j60_config = ETH_ENC28J60_DEFAULT_CONFIG(spi_handle);
+  enc28j60_config.int_gpio_num = this->interrupt_pin_;
+
+  // phy_config.phy_addr = this->phy_addr_spi_;
+  // phy_config.reset_gpio_num = this->reset_pin_;
+  phy_config.autonego_timeout_ms = 0;  // ENC28J60 doesn't support auto-negotiation
+  phy_config.reset_gpio_num = -1;      // ENC28J60 doesn't have a pin to reset internal PHY
+
+  mac_config.smi_mdc_gpio_num = -1;  // ENC28J60 doesn't have SMI interface
+  mac_config.smi_mdio_gpio_num = -1;
+  mac_config.rx_task_prio = 18;
+  esp_eth_mac_t *mac = esp_eth_mac_new_enc28j60(&enc28j60_config, &mac_config);
+
 #else
   phy_config.phy_addr = this->phy_addr_;
   phy_config.reset_gpio_num = this->power_pin_;
@@ -174,9 +212,16 @@ void EthernetComponent::setup() {
       break;
     }
 #endif
-#ifdef USE_ETHERNET_SPI
+#ifdef USE_ETHERNET_W5500
     case ETHERNET_TYPE_W5500: {
       this->phy_ = esp_eth_phy_new_w5500(&phy_config);
+      break;
+    }
+#endif
+#ifdef USE_ETHERNET_ENC28J60
+    case ETHERNET_TYPE_ENC28J60: {
+      this->phy_ = esp_eth_phy_new_enc28j60(&phy_config);
+
       break;
     }
 #endif
@@ -202,6 +247,13 @@ void EthernetComponent::setup() {
   }
 #endif
 
+#ifdef USE_ETHERNET_ENC28J60
+  // Set ENC28J60 to full duplex mode
+  // uint8_t mymac[] = { 0x02, 0x00, 0x00, 0x12, 0x34, 0x56};
+  // mac->set_addr(mac, mymac);
+
+#endif
+
   // use ESP internal eth mac
   uint8_t mac_addr[6];
   esp_read_mac(mac_addr, ESP_MAC_ETH);
@@ -225,6 +277,8 @@ void EthernetComponent::setup() {
   /* start Ethernet driver state machine */
   err = esp_eth_start(this->eth_handle_);
   ESPHL_ERROR_CHECK(err, "ETH start error");
+
+  enc28j60_set_phy_duplex(this->phy_, ETH_DUPLEX_FULL);
 }
 
 void EthernetComponent::loop() {
@@ -300,6 +354,10 @@ void EthernetComponent::dump_config() {
 
     case ETHERNET_TYPE_W5500:
       eth_type = "W5500";
+      break;
+
+    case ETHERNET_TYPE_ENC28J60:
+      eth_type = "ENC28J60";
       break;
 
     default:
